@@ -1,0 +1,11 @@
+{
+  "name": "pump-fun-bot-sprint-solution",
+  "version": "1.0.0",
+  "description": "Solana algorithmic trading bot for Make.fun Pump.fun Bot Sprint",
+  "main": "main.ts",
+  "type": "module",
+  "scripts": {
+    "start": "node main.ts"
+  },
+  "license": "MIT"
+}
