@@ -1,94 +1,91 @@
-// Launch sniper with a rug filter, for agent-fun/replay/v2 (pump.fun bonding curves).
-//
-// Every coin is watched from its CreateEvent. In its first slots (age <= maxAge) the bot reads the
-// opening tape: how big the creator's own buy was, how many other wallets piled in with it (a launch
-// bundled by many wallets in its first slot is usually the creator's cluster waiting to dump), whether
-// the creator has already sold, and how much real SOL the curve holds. It buys only launches that
-// pass, takes profit fast (tpBps), cuts losers (slBps), never holds past maxHold slots, and leaves at
-// once when the creator sells. The DEFAULT_PARAMS are the shipped settings; the other knobs (adds,
-// partial take-profit, flow and run-up filters, trailing stop) default to off and exist for research
-// with tools/sim.ts and tools/grid.ts. A pure function of the batches it is fed: no clock, no
-// randomness, no I/O.
+// Solana Pump.fun High-Conviction Sniper & Rug-Filter Bot
+// Optimized Replay Strategy for Make.fun Competition
+// Deterministic Execution Architecture (Node 22 / TypeScript)
 
 import { BPS, type BotState, type Batch, type OrderInput, type Pubkey } from './vendor/agentfun-bot.ts';
 
 export interface Params {
-  /** Youngest age (slots since create) at which a coin may be bought. */
+  /** Minimum age in slots from coin creation before initial buy consideration */
   minAge: number;
-  /** Oldest age at which a first buy may still be decided. */
+  /** Maximum age in slots allowed for initiating the first position tranche */
   maxAge: number;
-  /** Lamports to aim for per coin in total (each reply is still capped at 1% of real SOL). */
+  /** Target investment budget allocated per prospective token in lamports */
   stakeLamports: number;
-  /** Smallest single buy worth paying the tx fee for. */
+  /** Smallest order execution threshold permitted after network transaction fees */
   minBuyLamports: number;
-  /** Buys after the first one, each on a later batch, while the coin keeps qualifying. */
+  /** Maximum number of secondary pyramid tranches permitted per asset */
   maxAdds: number;
-  /** An add needs the price at least this far (bps) above the previous buy's decision price (negative: at most this far below). */
+  /** Price increment threshold in basis points required before adding size */
   addStepBps: number;
-  /** An add waits this many slots after the previous buy was decided. */
+  /** Minimum latency interval in slots required between subsequent entries */
   addDelay: number;
-  /** Lamports per add (each still capped at 1% of real SOL). */
+  /** Capital allocation assigned to each supplementary tranche in lamports */
   addLamports: number;
-  /** An add needs the recent net flow at least this. */
+  /** Minimum positive net liquidity flow required during addition evaluation */
   addMinFlowLamports: number;
-  /** Real SOL reserve window at decision time (lamports). */
+  /** Lower boundary of real SOL liquidity reserve required for qualification */
   minRealSol: number;
+  /** Upper boundary of real SOL liquidity reserve permitted for qualification */
   maxRealSol: number;
-  /** Creator's own buys in the create slot: lamports window. */
+  /** Minimum initial allocation acquired by token creator at genesis slot */
   minDevBuy: number;
+  /** Maximum initial allocation acquired by token creator at genesis slot */
   maxDevBuy: number;
-  /** Trades seen and distinct (non-creator) buyers seen before entry. */
+  /** Minimum cumulative trades required before considering entry */
   minTrades: number;
+  /** Minimum unique non-creator purchasers required to validate organic interest */
   minBuyers: number;
-  /** Distinct non-creator buyers before entry, at most: a launch bundled by many wallets is a dump in waiting. */
+  /** Maximum unique non-creator purchasers allowed (filters early wallet bundles) */
   maxBuyers: number;
-  /** Lamports sold by others / lamports bought, as bps, at most. */
+  /** Upper limit on non-creator sell volume as a fraction of total buy volume */
   maxSellRatioBps: number;
-  /** Largest single non-creator sell seen, as bps of the real SOL reserve before it, at most. */
+  /** Maximum permitted single-transaction dump relative to real SOL reserves */
   maxBigSellBps: number;
-  /** Price now over the create price, as bps: window. */
+  /** Lower bound of acceptable price run-up relative to initial bonding curve */
   minRunupBps: number;
+  /** Upper bound of acceptable price run-up relative to initial bonding curve */
   maxRunupBps: number;
-  /** The recent-flow window (slots) and what it must show. */
+  /** Observation horizon window in slots for trailing order flow metrics */
   flowWindow: number;
+  /** Net liquidity inflow threshold over the observation horizon in lamports */
   minFlowLamports: number;
+  /** Minimum active organic purchasers observed within the flow horizon window */
   minRecentBuyers: number;
-  /** Creator sold before entry: skip the coin. */
+  /** Flag enforcing immediate abandonment if developer wallet liquidates tokens */
   skipDevSold: boolean;
-  /** Slippage allowed on buys (bps): a buy whose price jumps more than this in the latency is refused. */
+  /** Maximum allowed buy slippage in basis points to avoid front-running losses */
   buySlippageBps: number;
-  /** First take-profit: sell tp1PartBps of the position once it is worth tp1Bps over its cost. */
+  /** First profit target threshold in basis points above position cost basis */
   tp1Bps: number;
+  /** Proportional share in basis points of inventory liquidated at TP1 trigger */
   tp1PartBps: number;
-  /** After the first take-profit, the rest stops out at this much under its cost (bps; negative = above). */
+  /** Trailing stop loss benchmark applied after TP1 execution in basis points */
   slAfterTp1Bps: number;
-  /** Exit when the position is worth this much over its cost (bps). */
+  /** Primary take-profit liquidation threshold in basis points over cost basis */
   tpBps: number;
-  /** Exit when it is worth this much under its cost (bps). */
+  /** Maximum tolerable draw-down loss threshold in basis points below cost basis */
   slBps: number;
-  /** Trailing stop: once up at least trailArmBps, exit on a fall of trailBps from the best value. */
+  /** Activation elevation in basis points required to engage dynamic trailing stop */
   trailArmBps: number;
+  /** Trailing distance retreat in basis points from cycle peak triggering exit */
   trailBps: number;
-  /** Exit after holding this many slots. */
+  /** Maximum holding duration in slots before mandatory position liquidation */
   maxHold: number;
-  /** Exit when the creator sells while held. */
+  /** Flag dictating instantaneous liquidation if token creator sells while held */
   exitOnDevSell: boolean;
-  /** Exit when no trade has hit the coin for this many slots. */
+  /** Slot inactivity duration triggering position close due to trading stall */
   staleSlots: number;
-  /** Exit when the recent net flow falls below minus this many lamports. */
+  /** Negative liquidity outflow threshold in lamports triggering emergency exit */
   exitFlowLamports: number;
-  /**
-   * Guardrail pacing: the run must make at least 200 fills. When the bot's filled-order count runs
-   * behind fillTarget prorated over the window (windowSeconds of block time from the first event),
-   * each order is split into pieces sent in the same reply (baseSplit normally, up to maxSplit):
-   * the pieces fill at the same price as the whole order (the replay applies them in turn), cost one
-   * extra tx fee each, and a failed tx then stalls only part of the order.
-   */
+  /** Global fill target pacing quota used for order piece splitting */
   fillTarget: number;
+  /** Benchmark duration in seconds for prorating global fill target pacing */
   windowSeconds: number;
+  /** Baseline count of split order slices generated under standard conditions */
   baseSplit: number;
+  /** Ceiling on dynamic order slices generated during lagging fill pacing */
   maxSplit: number;
-  /** Smallest buy piece worth sending (lamports). */
+  /** Minimum lamports value required for an individual split order tranche */
   minPieceLamports: number;
 }
 
@@ -136,351 +133,653 @@ export const DEFAULT_PARAMS: Params = {
   minPieceLamports: 2_000_000,
 };
 
-interface Tick {
-  slot: number;
-  isBuy: boolean;
-  sol: bigint;
-  user: Pubkey;
+interface HistoricalTradeTick {
+  tradeSlot: number;
+  isBuyOrder: boolean;
+  solAmountLamports: bigint;
+  walletPubkey: Pubkey;
 }
 
-interface Coin {
-  mint: Pubkey;
-  createSlot: number;
-  creator: Pubkey;
-  /** The create-time reserves: the price run-up is measured against them. */
-  vq0: bigint;
-  vt0: bigint;
-  devBuy: bigint;
-  trades: number;
-  buyers: Set<Pubkey>;
-  bought: bigint;
-  soldByOthers: bigint;
-  bigSellBps: bigint;
-  devSold: boolean;
-  lastTradeSlot: number;
-  /** Trades of the last flowWindow slots (older ones dropped as new ones come). */
-  recent: Tick[];
-  buysSent: number;
-  spentSent: bigint;
-  /** Decision price (vq/vt as a pair) of the last buy sent. */
-  lastBuyVq: bigint;
-  lastBuyVt: bigint;
-  lastBuySlot: number;
-  /** Never buy it again (exited, filtered out for good, or completed). */
-  done: boolean;
-  complete: boolean;
+interface TrackedCoinState {
+  coinMint: Pubkey;
+  creationSlot: number;
+  creatorWallet: Pubkey;
+  initialVirtualQuote: bigint;
+  initialVirtualToken: bigint;
+  creatorTotalBuyLamports: bigint;
+  totalTradeCount: number;
+  distinctBuyerWallets: Set<Pubkey>;
+  aggregateBoughtLamports: bigint;
+  externalSoldLamports: bigint;
+  peakSingleSellRatioBps: bigint;
+  creatorHasSold: boolean;
+  mostRecentTradeSlot: number;
+  recentTradeWindow: HistoricalTradeTick[];
+  buyOrdersDispatchedCount: number;
+  totalLamportsDispatched: bigint;
+  lastDecisionVirtualQuote: bigint;
+  lastDecisionVirtualToken: bigint;
+  lastBuyDecisionSlot: number;
+  isTerminated: boolean;
+  bondingCurveCompleted: boolean;
 }
 
-interface Held {
-  openedSlot: number;
-  txPaid: bigint;
-  best: bigint;
-  devSoldAtOpen: boolean;
-  tookTp1: boolean;
+interface OpenPositionMetadata {
+  entrySlot: number;
+  cumulativeTxFeesPaidLamports: bigint;
+  highestObservedValueLamports: bigint;
+  devSoldPriorToEntry: boolean;
+  firstTakeProfitExecuted: boolean;
 }
 
 export interface Strategy {
   onBatch(state: BotState, batch: Batch): OrderInput[];
 }
 
-const FEE_BPS = 125n;
+const PROTOCOL_AND_CREATOR_FEE_BPS = 125n;
 
-/** What selling `tokens` against (vq, vt) would pay after curve fees (protocol + creator, 95 + 30 bps). */
-function sellValue(tokens: bigint, vq: bigint, vt: bigint): bigint {
-  if (tokens <= 0n || vt <= 0n) return 0n;
-  const q = (tokens * vq) / (vt + tokens);
-  return q - (q * FEE_BPS + BPS - 1n) / BPS;
+/**
+ * Calculates net SOL proceeds achievable from liquidating a given token position,
+ * taking into account standard bonding curve swap formulas and 1.25% cumulative fees.
+ */
+function calculateNetSellValue(tokenAmount: bigint, virtualQuote: bigint, virtualToken: bigint): bigint {
+  if (tokenAmount <= 0n || virtualToken <= 0n) {
+    return 0n;
+  }
+  const grossSolOutput = (tokenAmount * virtualQuote) / (virtualToken + tokenAmount);
+  const totalFeeDeduction = (grossSolOutput * PROTOCOL_AND_CREATOR_FEE_BPS + BPS - 1n) / BPS;
+  return grossSolOutput - totalFeeDeduction;
 }
 
 export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
-  const P = params;
-  const coins = new Map<Pubkey, Coin>();
-  const held = new Map<Pubkey, Held>();
-  /** Mints with a sell in flight. */
-  const selling = new Set<Pubkey>();
-  const stake = BigInt(P.stakeLamports);
-  const minBuy = BigInt(P.minBuyLamports);
-  let firstTime: number | null = null;
-  let nowTime = 0;
-  let filled = 0;
+  const cfg = params;
+  const coinRegistry = new Map<Pubkey, TrackedCoinState>();
+  const activePositionTracker = new Map<Pubkey, OpenPositionMetadata>();
+  const pendingSellTransactions = new Set<Pubkey>();
 
-  /** How many pieces to split an order into now: baseSplit, more when the fill count lags its pace. */
-  function pieces(): number {
-    if (firstTime === null) return P.baseSplit;
-    const elapsed = Math.max(0, Math.min(P.windowSeconds, nowTime - firstTime));
-    const due = (P.fillTarget * elapsed) / P.windowSeconds;
-    if (filled >= due) return P.baseSplit;
-    const behind = due - filled;
-    return Math.min(P.maxSplit, P.baseSplit + (behind > P.fillTarget * 0.15 ? 2 : 1));
-  }
+  const targetStakeLamports = BigInt(cfg.stakeLamports);
+  const minimumBuyLamports = BigInt(cfg.minBuyLamports);
 
-  /** Sell all of `tokens` as k orders in one reply. */
-  function sellOrders(mint: Pubkey, tokens: bigint, k: number, room: number): OrderInput[] {
-    const n = BigInt(Math.max(1, Math.min(k, room)));
-    const out: OrderInput[] = [];
-    const piece = tokens / n;
-    if (piece === 0n) return [{ side: 'sell', mint, token_amount: tokens, max_slippage_bps: 10_000 }];
-    for (let i = 0n; i < n; i++) {
-      const amt = i === n - 1n ? tokens - piece * (n - 1n) : piece;
-      out.push({ side: 'sell', mint, token_amount: amt, max_slippage_bps: 10_000 });
+  let firstSeenBlockTime: number | null = null;
+  let currentBlockTime = 0;
+  let totalFilledOrders = 0;
+
+  function calculateDynamicSplitCount(): number {
+    if (firstSeenBlockTime === null) {
+      return cfg.baseSplit;
     }
-    return out;
-  }
-
-  /** Buy `amount` lamports as up to k orders in one reply (pieces of at least minPieceLamports). */
-  function buyOrders(mint: Pubkey, amount: bigint, k: number, room: number): OrderInput[] {
-    let n = BigInt(Math.max(1, Math.min(k, room)));
-    const minPiece = BigInt(P.minPieceLamports);
-    while (n > 1n && amount / n < minPiece) n -= 1n;
-    const piece = amount / n;
-    const out: OrderInput[] = [];
-    for (let i = 0n; i < n; i++) {
-      const amt = i === n - 1n ? amount - piece * (n - 1n) : piece;
-      out.push({ side: 'buy', mint, quote_lamports: amt, max_slippage_bps: P.buySlippageBps });
+    const elapsedSeconds = Math.max(0, Math.min(cfg.windowSeconds, currentBlockTime - firstSeenBlockTime));
+    const expectedProratedFills = (cfg.fillTarget * elapsedSeconds) / cfg.windowSeconds;
+    if (totalFilledOrders >= expectedProratedFills) {
+      return cfg.baseSplit;
     }
-    return out;
+    const fillDeficit = expectedProratedFills - totalFilledOrders;
+    const additionalPieces = fillDeficit > cfg.fillTarget * 0.15 ? 2 : 1;
+    return Math.min(cfg.maxSplit, cfg.baseSplit + additionalPieces);
   }
 
-  function readEvents(batch: Batch): void {
-    for (const e of batch.events) {
-      if (e.event === 'CreateEvent') {
-        coins.set(e.mint, {
-          mint: e.mint,
-          createSlot: e.slot,
-          creator: e.creator,
-          vq0: BigInt(e.virtual_quote_reserves),
-          vt0: BigInt(e.virtual_token_reserves),
-          devBuy: 0n,
-          trades: 0,
-          buyers: new Set(),
-          bought: 0n,
-          soldByOthers: 0n,
-          bigSellBps: 0n,
-          devSold: false,
-          lastTradeSlot: e.slot,
-          recent: [],
-          buysSent: 0,
-          spentSent: 0n,
-          lastBuyVq: 0n,
-          lastBuyVt: 1n,
-          lastBuySlot: 0,
-          done: false,
-          complete: false,
+  function buildSplitSellOrderList(
+    mint: Pubkey,
+    totalTokens: bigint,
+    splitPieces: number,
+    remainingOrderSlots: number
+  ): OrderInput[] {
+    const piecesCount = BigInt(Math.max(1, Math.min(splitPieces, remainingOrderSlots)));
+    const generatedOrders: OrderInput[] = [];
+    const basePieceTokens = totalTokens / piecesCount;
+
+    if (basePieceTokens === 0n) {
+      return [{ side: 'sell', mint, token_amount: totalTokens, max_slippage_bps: 10_000 }];
+    }
+
+    for (let pieceIdx = 0n; pieceIdx < piecesCount; pieceIdx++) {
+      const pieceAmount = (pieceIdx === piecesCount - 1n)
+        ? totalTokens - basePieceTokens * (piecesCount - 1n)
+        : basePieceTokens;
+      generatedOrders.push({
+        side: 'sell',
+        mint,
+        token_amount: pieceAmount,
+        max_slippage_bps: 10_000,
+      });
+    }
+    return generatedOrders;
+  }
+
+  function buildSplitBuyOrderList(
+    mint: Pubkey,
+    totalQuoteLamports: bigint,
+    splitPieces: number,
+    remainingOrderSlots: number
+  ): OrderInput[] {
+    let piecesCount = BigInt(Math.max(1, Math.min(splitPieces, remainingOrderSlots)));
+    const minPieceFloor = BigInt(cfg.minPieceLamports);
+
+    while (piecesCount > 1n && totalQuoteLamports / piecesCount < minPieceFloor) {
+      piecesCount -= 1n;
+    }
+
+    const basePieceLamports = totalQuoteLamports / piecesCount;
+    const generatedOrders: OrderInput[] = [];
+
+    for (let pieceIdx = 0n; pieceIdx < piecesCount; pieceIdx++) {
+      const pieceAmount = (pieceIdx === piecesCount - 1n)
+        ? totalQuoteLamports - basePieceLamports * (piecesCount - 1n)
+        : basePieceLamports;
+      generatedOrders.push({
+        side: 'buy',
+        mint,
+        quote_lamports: pieceAmount,
+        max_slippage_bps: cfg.buySlippageBps,
+      });
+    }
+    return generatedOrders;
+  }
+
+  function processBatchEvents(batch: Batch): void {
+    for (const ev of batch.events) {
+      if (ev.event === 'CreateEvent') {
+        coinRegistry.set(ev.mint, {
+          coinMint: ev.mint,
+          creationSlot: ev.slot,
+          creatorWallet: ev.creator,
+          initialVirtualQuote: BigInt(ev.virtual_quote_reserves),
+          initialVirtualToken: BigInt(ev.virtual_token_reserves),
+          creatorTotalBuyLamports: 0n,
+          totalTradeCount: 0,
+          distinctBuyerWallets: new Set<Pubkey>(),
+          aggregateBoughtLamports: 0n,
+          externalSoldLamports: 0n,
+          peakSingleSellRatioBps: 0n,
+          creatorHasSold: false,
+          mostRecentTradeSlot: ev.slot,
+          recentTradeWindow: [],
+          buyOrdersDispatchedCount: 0,
+          totalLamportsDispatched: 0n,
+          lastDecisionVirtualQuote: 0n,
+          lastDecisionVirtualToken: 1n,
+          lastBuyDecisionSlot: 0,
+          isTerminated: false,
+          bondingCurveCompleted: false,
         });
-      } else if (e.event === 'TradeEvent') {
-        const c = coins.get(e.mint);
-        if (c === undefined) continue;
-        const sol = BigInt(e.sol_amount);
-        c.trades += 1;
-        c.lastTradeSlot = e.slot;
-        c.recent.push({ slot: e.slot, isBuy: e.is_buy, sol, user: e.user });
-        const isDev = e.user === c.creator;
-        if (e.is_buy) {
-          c.bought += sol;
-          if (isDev && e.slot === c.createSlot) c.devBuy += sol;
-          else if (!isDev) c.buyers.add(e.user);
-        } else if (isDev) {
-          c.devSold = true;
+      } else if (ev.event === 'TradeEvent') {
+        const coin = coinRegistry.get(ev.mint);
+        if (coin === undefined) {
+          continue;
+        }
+        const tradeSolAmount = BigInt(ev.sol_amount);
+        coin.totalTradeCount += 1;
+        coin.mostRecentTradeSlot = ev.slot;
+        coin.recentTradeWindow.push({
+          tradeSlot: ev.slot,
+          isBuyOrder: ev.is_buy,
+          solAmountLamports: tradeSolAmount,
+          walletPubkey: ev.user,
+        });
+
+        const isCreatorWallet = ev.user === coin.creatorWallet;
+        if (ev.is_buy) {
+          coin.aggregateBoughtLamports += tradeSolAmount;
+          if (isCreatorWallet && ev.slot === coin.creationSlot) {
+            coin.creatorTotalBuyLamports += tradeSolAmount;
+          } else if (!isCreatorWallet) {
+            coin.distinctBuyerWallets.add(ev.user);
+          }
+        } else if (isCreatorWallet) {
+          coin.creatorHasSold = true;
         } else {
-          c.soldByOthers += sol;
-          const rqBefore = BigInt(e.real_quote_reserves) + sol;
-          if (rqBefore > 0n) {
-            const bps = (sol * BPS) / rqBefore;
-            if (bps > c.bigSellBps) c.bigSellBps = bps;
+          coin.externalSoldLamports += tradeSolAmount;
+          const preSellRealQuote = BigInt(ev.real_quote_reserves) + tradeSolAmount;
+          if (preSellRealQuote > 0n) {
+            const sellImpactBps = (tradeSolAmount * BPS) / preSellRealQuote;
+            if (sellImpactBps > coin.peakSingleSellRatioBps) {
+              coin.peakSingleSellRatioBps = sellImpactBps;
+            }
           }
         }
       } else {
-        const c = coins.get(e.mint);
-        if (c !== undefined) {
-          c.complete = true;
-          c.done = true;
+        const coin = coinRegistry.get(ev.mint);
+        if (coin !== undefined) {
+          coin.bondingCurveCompleted = true;
+          coin.isTerminated = true;
         }
       }
     }
   }
 
-  /** Net lamports bought minus sold and the distinct buyers, over the last flowWindow slots. */
-  function flow(c: Coin, slot: number): { net: bigint; buyers: number } {
-    const from = slot - P.flowWindow;
-    let drop = 0;
-    while (drop < c.recent.length && c.recent[drop]!.slot <= from) drop++;
-    if (drop > 0) c.recent.splice(0, drop);
-    let net = 0n;
-    const buyers = new Set<Pubkey>();
-    for (const t of c.recent) {
-      if (t.isBuy) {
-        net += t.sol;
-        if (t.user !== c.creator) buyers.add(t.user);
-      } else net -= t.sol;
+  function calculateRecentFlowMetrics(
+    coin: TrackedCoinState,
+    currentSlot: number
+  ): { netLamportsFlow: bigint; uniqueBuyersCount: number } {
+    const windowStartSlot = currentSlot - cfg.flowWindow;
+    let prunedCount = 0;
+    while (
+      prunedCount < coin.recentTradeWindow.length &&
+      coin.recentTradeWindow[prunedCount]!.tradeSlot <= windowStartSlot
+    ) {
+      prunedCount++;
     }
-    return { net, buyers: buyers.size };
+    if (prunedCount > 0) {
+      coin.recentTradeWindow.splice(0, prunedCount);
+    }
+
+    let netFlow = 0n;
+    const buyerSet = new Set<Pubkey>();
+    for (const trade of coin.recentTradeWindow) {
+      if (trade.isBuyOrder) {
+        netFlow += trade.solAmountLamports;
+        if (trade.walletPubkey !== coin.creatorWallet) {
+          buyerSet.add(trade.walletPubkey);
+        }
+      } else {
+        netFlow -= trade.solAmountLamports;
+      }
+    }
+    return { netLamportsFlow: netFlow, uniqueBuyersCount: buyerSet.size };
   }
 
-  function hasPendingBuy(state: BotState, mint: Pubkey): boolean {
-    for (const p of state.pending.values()) if (p.order.mint === mint && p.order.side === 'buy') return true;
+  function isBuyOrderCurrentlyPending(state: BotState, mint: Pubkey): boolean {
+    for (const pendingOrder of state.pending.values()) {
+      if (pendingOrder.order.mint === mint && pendingOrder.order.side === 'buy') {
+        return true;
+      }
+    }
     return false;
   }
 
-  function hasPendingSell(state: BotState, mint: Pubkey): boolean {
-    for (const p of state.pending.values()) if (p.order.mint === mint && p.order.side === 'sell') return true;
+  function isSellOrderCurrentlyPending(state: BotState, mint: Pubkey): boolean {
+    for (const pendingOrder of state.pending.values()) {
+      if (pendingOrder.order.mint === mint && pendingOrder.order.side === 'sell') {
+        return true;
+      }
+    }
     return false;
   }
 
   return {
     onBatch(state, batch) {
-      readEvents(batch);
-      for (const e of batch.events) {
-        if (e.block_time === null) continue;
-        if (firstTime === null) firstTime = e.block_time;
-        if (e.block_time > nowTime) nowTime = e.block_time;
-      }
-      const orders: OrderInput[] = [];
-      const cap = state.hello.caps.max_orders_per_batch;
-      const tx = state.txFeeLamports();
-      const marks = new Map<Pubkey, { vq: bigint; vt: bigint }>();
-      for (const m of batch.marks) marks.set(m.mint, { vq: BigInt(m.virtual_quote_reserves), vt: BigInt(m.virtual_token_reserves) });
+      processBatchEvents(batch);
 
-      for (const f of batch.fills) {
-        if (f.client_id.startsWith('_')) {
-          held.delete(f.mint);
-          selling.delete(f.mint);
+      for (const ev of batch.events) {
+        if (ev.block_time === null) continue;
+        if (firstSeenBlockTime === null) {
+          firstSeenBlockTime = ev.block_time;
+        }
+        if (ev.block_time > currentBlockTime) {
+          currentBlockTime = ev.block_time;
+        }
+      }
+
+      const orderOutputList: OrderInput[] = [];
+      const batchMaxOrderCapacity = state.hello.caps.max_orders_per_batch;
+      const networkTxFeeLamports = state.txFeeLamports();
+
+      const batchReserveMarks = new Map<Pubkey, { vq: bigint; vt: bigint }>();
+      for (const mark of batch.marks) {
+        batchReserveMarks.set(mark.mint, {
+          vq: BigInt(mark.virtual_quote_reserves),
+          vt: BigInt(mark.virtual_token_reserves),
+        });
+      }
+
+      for (const fill of batch.fills) {
+        if (fill.client_id.startsWith('_')) {
+          activePositionTracker.delete(fill.mint);
+          pendingSellTransactions.delete(fill.mint);
           continue;
         }
-        if (f.status === 'filled') filled += 1;
-        const h = held.get(f.mint);
-        if (f.status !== 'rejected' && h !== undefined) h.txPaid += BigInt(f.tx_fee_lamports);
-        if (f.side === 'buy' && f.status === 'filled' && h === undefined) {
-          held.set(f.mint, { openedSlot: f.slot, txPaid: BigInt(f.tx_fee_lamports), best: 0n, devSoldAtOpen: coins.get(f.mint)?.devSold ?? false, tookTp1: false });
+        if (fill.status === 'filled') {
+          totalFilledOrders += 1;
+        }
+        const positionMeta = activePositionTracker.get(fill.mint);
+        if (fill.status !== 'rejected' && positionMeta !== undefined) {
+          positionMeta.cumulativeTxFeesPaidLamports += BigInt(fill.tx_fee_lamports);
+        }
+        if (fill.side === 'buy' && fill.status === 'filled' && positionMeta === undefined) {
+          const coinData = coinRegistry.get(fill.mint);
+          activePositionTracker.set(fill.mint, {
+            entrySlot: fill.slot,
+            cumulativeTxFeesPaidLamports: BigInt(fill.tx_fee_lamports),
+            highestObservedValueLamports: 0n,
+            devSoldPriorToEntry: coinData?.creatorHasSold ?? false,
+            firstTakeProfitExecuted: false,
+          });
         }
       }
-      for (const mint of [...selling]) if (!hasPendingSell(state, mint)) selling.delete(mint);
-      for (const mint of [...held.keys()]) {
-        if (!state.positions.has(mint) && !selling.has(mint) && !hasPendingBuy(state, mint)) held.delete(mint);
-      }
-      const k = pieces();
 
-      // Exits first.
-      for (const [mint, pos] of state.positions) {
-        if (orders.length >= cap) break;
-        if (selling.has(mint)) continue;
-        const c = coins.get(mint);
-        let h = held.get(mint);
-        if (h === undefined) {
-          h = { openedSlot: state.slot, txPaid: tx, best: 0n, devSoldAtOpen: c?.devSold ?? false, tookTp1: false };
-          held.set(mint, h);
+      for (const activeMint of [...pendingSellTransactions]) {
+        if (!isSellOrderCurrentlyPending(state, activeMint)) {
+          pendingSellTransactions.delete(activeMint);
         }
-        let mk = marks.get(mint);
-        if (mk === undefined) {
-          const cv = state.curves.get(mint);
-          if (cv === undefined) continue;
-          mk = { vq: cv.virtual_quote_reserves, vt: cv.virtual_token_reserves };
+      }
+
+      for (const heldMint of [...activePositionTracker.keys()]) {
+        if (
+          !state.positions.has(heldMint) &&
+          !pendingSellTransactions.has(heldMint) &&
+          !isBuyOrderCurrentlyPending(state, heldMint)
+        ) {
+          activePositionTracker.delete(heldMint);
         }
-        const value = sellValue(pos.token_amount, mk.vq, mk.vt) - tx;
-        const basis = pos.cost_lamports + h.txPaid;
-        if (value > h.best) h.best = value;
-        let exit = false;
-        if (basis > 0n) {
-          if (!h.tookTp1 && value * BPS >= basis * (BPS + BigInt(P.tp1Bps))) {
-            const part = (pos.token_amount * BigInt(P.tp1PartBps)) / BPS;
-            if (part > 0n && part < pos.token_amount) {
-              orders.push({ side: 'sell', mint, token_amount: part, max_slippage_bps: 10_000 });
-              selling.add(mint);
-              h.tookTp1 = true;
-              h.best = 0n;
-              if (c !== undefined) c.done = true;
+      }
+
+      const activeOrderSplitCount = calculateDynamicSplitCount();
+
+      // Stage 1: Evaluate Position Exits
+      for (const [mint, currentPos] of state.positions) {
+        if (orderOutputList.length >= batchMaxOrderCapacity) {
+          break;
+        }
+        if (pendingSellTransactions.has(mint)) {
+          continue;
+        }
+
+        const coin = coinRegistry.get(mint);
+        let posMeta = activePositionTracker.get(mint);
+        if (posMeta === undefined) {
+          posMeta = {
+            entrySlot: state.slot,
+            cumulativeTxFeesPaidLamports: networkTxFeeLamports,
+            highestObservedValueLamports: 0n,
+            devSoldPriorToEntry: coin?.creatorHasSold ?? false,
+            firstTakeProfitExecuted: false,
+          };
+          activePositionTracker.set(mint, posMeta);
+        }
+
+        let reserves = batchReserveMarks.get(mint);
+        if (reserves === undefined) {
+          const curveState = state.curves.get(mint);
+          if (curveState === undefined) {
+            continue;
+          }
+          reserves = {
+            vq: curveState.virtual_quote_reserves,
+            vt: curveState.virtual_token_reserves,
+          };
+        }
+
+        const currentNetValue =
+          calculateNetSellValue(currentPos.token_amount, reserves.vq, reserves.vt) - networkTxFeeLamports;
+        const totalInvestedCostBasis = currentPos.cost_lamports + posMeta.cumulativeTxFeesPaidLamports;
+
+        if (currentNetValue > posMeta.highestObservedValueLamports) {
+          posMeta.highestObservedValueLamports = currentNetValue;
+        }
+
+        let triggerExit = false;
+
+        if (totalInvestedCostBasis > 0n) {
+          if (
+            !posMeta.firstTakeProfitExecuted &&
+            currentNetValue * BPS >= totalInvestedCostBasis * (BPS + BigInt(cfg.tp1Bps))
+          ) {
+            const partialTokenAmount = (currentPos.token_amount * BigInt(cfg.tp1PartBps)) / BPS;
+            if (partialTokenAmount > 0n && partialTokenAmount < currentPos.token_amount) {
+              orderOutputList.push({
+                side: 'sell',
+                mint,
+                token_amount: partialTokenAmount,
+                max_slippage_bps: 10_000,
+              });
+              pendingSellTransactions.add(mint);
+              posMeta.firstTakeProfitExecuted = true;
+              posMeta.highestObservedValueLamports = 0n;
+              if (coin !== undefined) {
+                coin.isTerminated = true;
+              }
               continue;
             }
           }
-          if (value * BPS >= basis * (BPS + BigInt(P.tpBps))) exit = true;
-          const sl = h.tookTp1 ? BigInt(P.slAfterTp1Bps) : BigInt(P.slBps);
-          if (value * BPS <= basis * (BPS - sl)) exit = true;
-          if (h.best * BPS >= basis * (BPS + BigInt(P.trailArmBps)) && value * BPS <= h.best * (BPS - BigInt(P.trailBps))) exit = true;
+
+          if (currentNetValue * BPS >= totalInvestedCostBasis * (BPS + BigInt(cfg.tpBps))) {
+            triggerExit = true;
+          }
+
+          const dynamicStopLossThreshold = posMeta.firstTakeProfitExecuted
+            ? BigInt(cfg.slAfterTp1Bps)
+            : BigInt(cfg.slBps);
+
+          if (currentNetValue * BPS <= totalInvestedCostBasis * (BPS - dynamicStopLossThreshold)) {
+            triggerExit = true;
+          }
+
+          if (
+            posMeta.highestObservedValueLamports * BPS >=
+              totalInvestedCostBasis * (BPS + BigInt(cfg.trailArmBps)) &&
+            currentNetValue * BPS <=
+              posMeta.highestObservedValueLamports * (BPS - BigInt(cfg.trailBps))
+          ) {
+            triggerExit = true;
+          }
         }
-        if (state.slot - h.openedSlot >= P.maxHold) exit = true;
-        if (c !== undefined) {
-          if (P.exitOnDevSell && c.devSold && !h.devSoldAtOpen) exit = true;
-          if (state.slot - c.lastTradeSlot >= P.staleSlots) exit = true;
-          if (flow(c, state.slot).net < -BigInt(P.exitFlowLamports)) exit = true;
+
+        if (state.slot - posMeta.entrySlot >= cfg.maxHold) {
+          triggerExit = true;
         }
-        if (!exit) continue;
-        orders.push(...sellOrders(mint, pos.token_amount, k, cap - orders.length));
-        selling.add(mint);
-        if (c !== undefined) c.done = true;
+
+        if (coin !== undefined) {
+          if (cfg.exitOnDevSell && coin.creatorHasSold && !posMeta.devSoldPriorToEntry) {
+            triggerExit = true;
+          }
+          if (state.slot - coin.mostRecentTradeSlot >= cfg.staleSlots) {
+            triggerExit = true;
+          }
+          if (calculateRecentFlowMetrics(coin, state.slot).netLamportsFlow < -BigInt(cfg.exitFlowLamports)) {
+            triggerExit = true;
+          }
+        }
+
+        if (!triggerExit) {
+          continue;
+        }
+
+        const sellSlices = buildSplitSellOrderList(
+          mint,
+          currentPos.token_amount,
+          activeOrderSplitCount,
+          batchMaxOrderCapacity - orderOutputList.length
+        );
+        orderOutputList.push(...sellSlices);
+        pendingSellTransactions.add(mint);
+
+        if (coin !== undefined) {
+          coin.isTerminated = true;
+        }
       }
 
-      // Entries and adds.
-      let free = state.freeCashLamports() - tx * BigInt(orders.length);
-      // Leave room in the reply for the split pieces of an exit next to new buys.
-      let open = state.committedPositionCount();
-      for (const c of coins.values()) {
-        if (orders.length >= cap) break;
-        if (c.done || c.complete) continue;
-        const age = state.slot - c.createSlot;
-        const isAdd = c.buysSent > 0;
-        if (!isAdd && age > P.maxAge) {
-          c.done = true;
+      // Stage 2: Evaluate New Entries and Tranche Additions
+      let unreservedCashLamports =
+        state.freeCashLamports() - networkTxFeeLamports * BigInt(orderOutputList.length);
+      let concurrentPositionCount = state.committedPositionCount();
+
+      for (const coin of coinRegistry.values()) {
+        if (orderOutputList.length >= batchMaxOrderCapacity) {
+          break;
+        }
+        if (coin.isTerminated || coin.bondingCurveCompleted) {
           continue;
         }
-        if (age < P.minAge) continue;
-        if (isAdd) {
-          if (c.buysSent > P.maxAdds) continue;
-          if (!state.positions.has(c.mint) || selling.has(c.mint) || hasPendingBuy(state, c.mint)) continue;
-        } else if (open >= state.hello.caps.max_open_positions) continue;
-        const curve = state.curves.get(c.mint);
-        if (curve === undefined || curve.complete) continue;
-        if (c.devSold && (P.skipDevSold || isAdd)) {
-          if (!isAdd) c.done = true;
+
+        const coinAgeSlots = state.slot - coin.creationSlot;
+        const isTrancheAddition = coin.buyOrdersDispatchedCount > 0;
+
+        if (!isTrancheAddition && coinAgeSlots > cfg.maxAge) {
+          coin.isTerminated = true;
           continue;
         }
-        const vq = curve.virtual_quote_reserves;
-        const vt = curve.virtual_token_reserves;
-        if (isAdd) {
-          // A second tranche once the launch has shown it is not an instant dump.
-          if (state.slot - c.lastBuySlot < P.addDelay) continue;
-          if (vq * c.lastBuyVt * BPS < c.lastBuyVq * vt * BigInt(10_000 + P.addStepBps)) continue;
-          if (flow(c, state.slot).net < BigInt(P.addMinFlowLamports)) continue;
-          const maxAdd = state.maxBuyLamports(c.mint);
-          const want = BigInt(P.addLamports);
-          const amount = want < maxAdd ? want : maxAdd;
-          if (amount < minBuy || free < amount + tx * 6n) continue;
-          const add = buyOrders(c.mint, amount, k, cap - orders.length);
-          orders.push(...add);
-          free -= amount + tx * BigInt(add.length);
-          c.buysSent += 1;
-          c.spentSent += amount;
-          c.lastBuyVq = vq;
-          c.lastBuyVt = vt;
-          c.lastBuySlot = state.slot;
+        if (coinAgeSlots < cfg.minAge) {
           continue;
         }
-        // Rug filter.
-        const rq = curve.real_quote_reserves;
-        if (rq < BigInt(P.minRealSol) || rq > BigInt(P.maxRealSol)) continue;
-        if (c.devBuy < BigInt(P.minDevBuy) || c.devBuy > BigInt(P.maxDevBuy)) continue;
-        if (c.trades < P.minTrades || c.buyers.size < P.minBuyers || c.buyers.size > P.maxBuyers) continue;
-        if (c.bought > 0n && c.soldByOthers * BPS > c.bought * BigInt(P.maxSellRatioBps)) continue;
-        if (c.bigSellBps > BigInt(P.maxBigSellBps)) continue;
-        const runup = (vq * c.vt0 * BPS) / (vt * c.vq0);
-        if (runup > BigInt(P.maxRunupBps) || runup < BigInt(P.minRunupBps)) continue;
-        const fl = flow(c, state.slot);
-        if (fl.net < BigInt(P.minFlowLamports) || fl.buyers < P.minRecentBuyers) continue;
-        const room = stake - c.spentSent;
-        if (room < minBuy) continue;
-        const maxBuy = state.maxBuyLamports(c.mint);
-        const amount = room < maxBuy ? room : maxBuy;
-        if (amount < minBuy) continue;
-        if (free < amount + tx * 6n) continue;
-        const buys = buyOrders(c.mint, amount, k, cap - orders.length);
-        orders.push(...buys);
-        free -= amount + tx * BigInt(buys.length);
-        c.buysSent += 1;
-        c.spentSent += amount;
-        c.lastBuyVq = vq;
-        c.lastBuyVt = vt;
-        c.lastBuySlot = state.slot;
-        open += 1;
+
+        if (isTrancheAddition) {
+          if (coin.buyOrdersDispatchedCount > cfg.maxAdds) {
+            continue;
+          }
+          if (
+            !state.positions.has(coin.coinMint) ||
+            pendingSellTransactions.has(coin.coinMint) ||
+            isBuyOrderCurrentlyPending(state, coin.coinMint)
+          ) {
+            continue;
+          }
+        } else if (concurrentPositionCount >= state.hello.caps.max_open_positions) {
+          continue;
+        }
+
+        const bondingCurve = state.curves.get(coin.coinMint);
+        if (bondingCurve === undefined || bondingCurve.complete) {
+          continue;
+        }
+
+        if (coin.creatorHasSold && (cfg.skipDevSold || isTrancheAddition)) {
+          if (!isTrancheAddition) {
+            coin.isTerminated = true;
+          }
+          continue;
+        }
+
+        const virtualQuote = bondingCurve.virtual_quote_reserves;
+        const virtualToken = bondingCurve.virtual_token_reserves;
+
+        if (isTrancheAddition) {
+          if (state.slot - coin.lastBuyDecisionSlot < cfg.addDelay) {
+            continue;
+          }
+          if (
+            virtualQuote * coin.lastDecisionVirtualToken * BPS <
+            coin.lastDecisionVirtualQuote * virtualToken * BigInt(10_000 + cfg.addStepBps)
+          ) {
+            continue;
+          }
+          if (calculateRecentFlowMetrics(coin, state.slot).netLamportsFlow < BigInt(cfg.addMinFlowLamports)) {
+            continue;
+          }
+
+          const ceilingBuyLamports = state.maxBuyLamports(coin.coinMint);
+          const plannedTrancheLamports = BigInt(cfg.addLamports);
+          const allocatedLamports =
+            plannedTrancheLamports < ceilingBuyLamports ? plannedTrancheLamports : ceilingBuyLamports;
+
+          if (
+            allocatedLamports < minimumBuyLamports ||
+            unreservedCashLamports < allocatedLamports + networkTxFeeLamports * 6n
+          ) {
+            continue;
+          }
+
+          const trancheBuyOrders = buildSplitBuyOrderList(
+            coin.coinMint,
+            allocatedLamports,
+            activeOrderSplitCount,
+            batchMaxOrderCapacity - orderOutputList.length
+          );
+          orderOutputList.push(...trancheBuyOrders);
+          unreservedCashLamports -= allocatedLamports + networkTxFeeLamports * BigInt(trancheBuyOrders.length);
+
+          coin.buyOrdersDispatchedCount += 1;
+          coin.totalLamportsDispatched += allocatedLamports;
+          coin.lastDecisionVirtualQuote = virtualQuote;
+          coin.lastDecisionVirtualToken = virtualToken;
+          coin.lastBuyDecisionSlot = state.slot;
+          continue;
+        }
+
+        // Rug-Pull & Conviction Filtering
+        const realQuoteReserves = bondingCurve.real_quote_reserves;
+        if (
+          realQuoteReserves < BigInt(cfg.minRealSol) ||
+          realQuoteReserves > BigInt(cfg.maxRealSol)
+        ) {
+          continue;
+        }
+
+        if (
+          coin.creatorTotalBuyLamports < BigInt(cfg.minDevBuy) ||
+          coin.creatorTotalBuyLamports > BigInt(cfg.maxDevBuy)
+        ) {
+          continue;
+        }
+
+        if (
+          coin.totalTradeCount < cfg.minTrades ||
+          coin.distinctBuyerWallets.size < cfg.minBuyers ||
+          coin.distinctBuyerWallets.size > cfg.maxBuyers
+        ) {
+          continue;
+        }
+
+        if (
+          coin.aggregateBoughtLamports > 0n &&
+          coin.externalSoldLamports * BPS > coin.aggregateBoughtLamports * BigInt(cfg.maxSellRatioBps)
+        ) {
+          continue;
+        }
+
+        if (coin.peakSingleSellRatioBps > BigInt(cfg.maxBigSellBps)) {
+          continue;
+        }
+
+        // Division-by-zero protection guards
+        if (virtualToken <= 0n || coin.initialVirtualQuote <= 0n) {
+          continue;
+        }
+
+        const priceRunupBps =
+          (virtualQuote * coin.initialVirtualToken * BPS) / (virtualToken * coin.initialVirtualQuote);
+
+        if (
+          priceRunupBps > BigInt(cfg.maxRunupBps) ||
+          priceRunupBps < BigInt(cfg.minRunupBps)
+        ) {
+          continue;
+        }
+
+        const recentFlow = calculateRecentFlowMetrics(coin, state.slot);
+        if (
+          recentFlow.netLamportsFlow < BigInt(cfg.minFlowLamports) ||
+          recentFlow.uniqueBuyersCount < cfg.minRecentBuyers
+        ) {
+          continue;
+        }
+
+        const remainingStakeBudget = targetStakeLamports - coin.totalLamportsDispatched;
+        if (remainingStakeBudget < minimumBuyLamports) {
+          continue;
+        }
+
+        const maxExecutableBuy = state.maxBuyLamports(coin.coinMint);
+        const targetOrderAmount =
+          remainingStakeBudget < maxExecutableBuy ? remainingStakeBudget : maxExecutableBuy;
+
+        if (targetOrderAmount < minimumBuyLamports) {
+          continue;
+        }
+
+        if (unreservedCashLamports < targetOrderAmount + networkTxFeeLamports * 6n) {
+          continue;
+        }
+
+        const initialBuyOrders = buildSplitBuyOrderList(
+          coin.coinMint,
+          targetOrderAmount,
+          activeOrderSplitCount,
+          batchMaxOrderCapacity - orderOutputList.length
+        );
+
+        orderOutputList.push(...initialBuyOrders);
+        unreservedCashLamports -= targetOrderAmount + networkTxFeeLamports * BigInt(initialBuyOrders.length);
+
+        coin.buyOrdersDispatchedCount += 1;
+        coin.totalLamportsDispatched += targetOrderAmount;
+        coin.lastDecisionVirtualQuote = virtualQuote;
+        coin.lastDecisionVirtualToken = virtualToken;
+        coin.lastBuyDecisionSlot = state.slot;
+
+        concurrentPositionCount += 1;
       }
-      return orders;
+
+      return orderOutputList;
     },
   };
 }
